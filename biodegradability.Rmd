@@ -1,0 +1,286 @@
+---
+title: "Биоразлагаемость химических молекул"
+author: "Бобров Евгений, 417"
+date: '`r Sys.Date()`'
+output:
+  md_document:
+    variant: markdown_github
+---
+
+# Постановка задачи.
+
+1055 химических молекул описаны с помощью 41 признака (число атомов кислорода, нитратных групп, донорных связей с водородом, потенциал ионизации и т.д.); 355 из них биоразложимы. Какие свойства молекул влияют на их биоразлагаемость?
+
+
+# Решение.
+
+```{r results='hide', warning=FALSE, message=FALSE, echo=FALSE}
+library(mfp)
+library(lattice)
+library(AUC)
+library(plyr)
+library(lmtest)
+library(usdm)
+```
+
+Загрузка данных.
+
+```{r}
+data = read.csv("dataset.csv", sep = ";", header = F, dec=".")
+data["V42"] = as.integer(unlist(data["V42"]))
+data["V42"][unlist(data["V42"])==2,] = 0
+data["V42"] = as.integer(unlist(data["V42"]))
+head(data)
+```
+
+
+
+В данной задаче отклик бинарный. Пусть свойство разложимости молекулы $y$ имеет распределение Бернулли. Тогда выборка $Y$ распределена по биномиальному закону. Для решение подобного рода задач используются обобщённые линейные модели с биномиальным распределением.
+
+Посмотрим на распределения непрерывных признаков в классах:
+
+```{r, echo=FALSE, fig.height=10, fig.width=10, warning=FALSE}
+par(mfrow=c(5, 4), mar=c(4, 2, 2, 1))
+for (n in names(data[,sapply(data, class) == "numeric"])){
+  d1 = density(data[data$V42 == 1, n])
+  d2 = density(data[data$V42 == 0, n])
+  plot(d1, col="blue", xlim=c(min(d1$x, d2$x), max(d1$x, d2$x)), ylim=c(min(d1$y, d2$y), max(d1$y, d2$y)), xlab=n, main="")
+  lines(d2, col="red")
+}
+
+plot(1, type = "n", axes=FALSE, xlab="", ylab="")
+legend("center", c("RB", "NRB"), lty=c(1,1), col=c("blue", "red"))
+```
+
+Линейной разделимости по отдельным признакам нет. Для логистической регрессии это хорошо: коэффициенты модели не будут бесконечно возрастать при обучении, и регуляризация Фирта не требуется.
+
+# Модель 1
+
+Построим самую первую модель наших ииследований $m_1$:
+```{r, warning=FALSE}
+m1 = glm(V42 ~ ., binomial, data)
+summary(m1)
+```
+
+
+# Модель 2
+
+Для предварительного отбора признаков построим одномерные модели по каждому фактору и оценим их значимость:
+
+```{r, echo=TRUE, warning=FALSE}
+m1 = glm(V42~1, binomial, data)
+a1 = add1(m1, names(data), test="LRT")
+a1
+mask = append(a1[2:ncol(data),5] < 0.25, T)
+```
+
+
+Сравним многомерные модели как со всеми предикторами ($m_1$), так и со значимыми на уровне меньшем 0.25 ($m_2$). Используя критерий отношения правдородобия находим, что вторая модель $m_2$ значимо лучше. Возьмём её:
+
+```{r, message=FALSE, warning=FALSE}
+data2 = data[, mask]
+head(data2)
+m2 = glm(V42 ~ ., family=binomial, data2)
+summary(m2)$aic
+lrtest(m2, m1)
+```
+
+# Модель 3
+
+Посмотрим на таблицы сопряжённости по категориальным признакам:
+
+```{r, warning=FALSE, include=FALSE}
+for (n in names(data[,sapply(data, class) == "integer"])){
+  print(n)
+  s = summary(m1)$coefficients
+  print(c("p-value:", s[rownames(s)==n,4]))
+  print(table(unlist(data[n]), unlist(data["V42"])))
+}
+```
+
+Вывод всех таблиц будет достаточно громоздким. Здесь рассмотрим только признаки $V19$ и $V42$. Они близки к константным и их уровени значимости равны $0.99$. Исключим их из модели.
+
+```{r}
+table(data2$V19, data2$V42)
+table(data2$V21, data2$V42)
+summary(m2)
+```
+
+
+```{r, warning=FALSE}
+data3 = data2
+data3$V19 = NULL
+data3$V21 = NULL
+m3 = glm(V42 ~ . , binomial, data3)
+summary(m3)$aic
+lrtest(m3, m2)
+```
+
+
+# Модель 4
+
+Проверим линейность логита по непрерывным признакам. Сглаженные диаграммы рассеяния:
+
+```{r, fig.height=10, fig.width=10}
+par(mfrow=c(4, 4), mar=c(4, 2, 2, 1))
+for (n in names(data3[,sapply(data3, class) == "numeric"])){
+  lw = ksmooth(unlist(data3[n]), 1 * (data3$V42 == 1), kernel = "normal", bandwidth=sd(unlist(data3[n])))
+  lsm = log(lw$y / (1-lw$y))
+  plot(lw$x, lsm, type="l", xlab=n, ylab ="Log-odds",col="red", lwd=2)
+}
+```
+
+
+
+```{r}
+names(data3[,sapply(data3, class) == "numeric"])
+```
+
+
+По некоторым признакам логит существенно нелинеен. Попробуем подобрать дробные полиномы для непрерывных признаков:
+```{r, warning=FALSE, echo=TRUE, cache=TRUE}
+mfp(V42 ~ fp(V1) + fp(V8) + fp(V12) + fp(V13) + fp(V14) + fp(V15) + fp(V17) + fp(V18) + fp(V22) + fp(V27) + fp(V30) + fp(V31) + fp(V36) + fp(V37) + fp(V39), data3, binomial)
+```
+
+Есть единственное интерпретируемое преобразование признака $V_{22} \rightarrow V_{22}^{3}$. 
+
+```{r}
+lw = ksmooth(data3$V22^3, 1 * (data3$V42 == 1), kernel = "normal", bandwidth=sd(data3$V22))
+lsm = log(lw$y / (1-lw$y))
+plot(lw$x, lsm, type="l", xlab="V_{22}^3", ylab ="Log-odds",col="red", lwd=2)
+```
+
+Что не привело логистические остатки к линейной форме. И полиномиальные преобразования не нужны.
+
+Избавимся от мультиколлинеарности в модели. Ипользуя функционал $VIF_{j} = \frac{1}{1-R_{j}}$, будем последовательно исключать признаки, на которых функционал принимает значения $>10$, и критерий отношения правдоподобия гарантирует значимое улучшение модели.
+
+```{r, warning=FALSE}
+vif(data3)
+data4 = data3
+data4$V39 = NULL
+data4$V36 = NULL
+data4$V13 = NULL
+data4$V15 = NULL
+data4$V1 = NULL
+data4$V18 = NULL
+data4$V17 = NULL
+vif(data4)
+m4 = glm(V42 ~ . ,binomial, data4)
+summary(m4)$aic
+lrtest(m4, m3)
+```
+
+В модели $m_4$ отсутствует мультиколлинеарность.
+
+
+# Модель 5
+Попробуем добавлять в линейную модель попарные взаимодействия:
+```{r, echo=TRUE, warning=FALSE, cache=TRUE}
+add1(m4, scope= ~ .^2, test="LRT")
+```  
+
+Попробуем добавить несколько наиболее значимых:
+```{r, echo=TRUE, warning=FALSE}
+m5 = glm(V42 ~ . + V9:V32 + V8:V22 + V8:V11, binomial, data4)
+summary(m5)
+lrtest(m5, m4)
+```  
+По критерию отношения правдоподобия получается лучше, однако часть коэффициентов модели незначимы.
+
+# Модель 6
+Проверим, что можно безболезненно удалить незначимые коэффициенты:
+```{r, echo=TRUE, warning=FALSE}
+summary(m5)
+drop1(m5, test="LRT")
+```  
+
+```{r, echo=TRUE, warning=FALSE}
+data6 = data4
+data6$V3 = NULL
+data6$V4 = NULL
+data6$V5 =  NULL
+data6$V10 = NULL
+data6$V14 = NULL
+data6$V23 = NULL
+data6$V24 = NULL
+data6$V29 = NULL
+data6$V30 = NULL
+data6$V31 = NULL
+data6$V33 = NULL
+data6$V34 = NULL
+m6 = glm(V42 ~ . + V9:V32 + V8:V22 + V8:V11 - V9 - V22 - V26, binomial, data6)
+summary(m6)
+lrtest(m6, m5)
+```
+Модель получается не хуже пятой и не хуже четвёртой; остановимся на ней.
+
+# Модель 7
+
+Теперь удалим незначимые коэффициенты модели $m_6$:
+
+```{r}
+m7 = glm(V42 ~ . + V9:V32 + V8:V22 + V8:V11 - V9 - V22 - V26 - V12 - V25, binomial, data6)
+summary(m7)
+lrtest(m7, m6)
+```
+
+Лучше уже не получается. Тогда не будем удалять больше факторов.
+
+
+Попробуем удалить влиятельные наблюдения:
+```{r, echo=TRUE}
+phat = predict(m6, type="response")
+
+par(mfrow=c(1,1))
+plot(phat, cooks.distance(m6), pch=20, xlab=expression(hat(pi)(x[i])), ylab="Cook's distance")
+lines(c(0,1), c(0.02,0.02), col="red", lwd=2)
+
+data7 = data6[cooks.distance(m6)<0.05,]
+m7 = glm(V42 ~ . + V9:V32 + V8:V22 + V8:V11 - V9 - V22 - V26, binomial, data7)
+summary(m7)
+```
+Сравнить полученные коэффициенты с коэффициентами модели, настроенной по полным данным:
+```{r, echo=TRUE}
+res = cbind(coefficients(m6), coefficients(m7))
+colnames(res) = c("All data", "Filtered data")
+res
+```
+Различия большие, так что примем модель, настроенную на укороченных данных.
+
+# Заключение и выводы
+
+Посмотрим на качество классификации:
+```{r, echo=TRUE, fig.height=5.5, fig.width=10}
+par(mfrow=c(1,2))
+phat = predict(m7, type="response")
+
+sens = sensitivity(phat, factor(1 * (data$V42 == 1)))
+plot(sens, col="red")
+spec = specificity(phat, factor(1 * (data$V42 == 1)))
+lines(spec$cutoffs, spec$measure, col="blue", ylab="")
+grid()
+legend("bottom", c("sensitivity", "specificity"), lty=c(1,1), col=c("red", "blue"))
+
+r = roc(phat, factor(1 * (data$V42 == 1)))
+plot(r)
+```
+
+При пороге 0.4 построенная модель обеспечивает чувствительность и специфичность, равные $\approx$ 0.8; площадь под ROC-кривой составляет `r auc(r)`. 
+
+Приросты отношений шансов на биоразлагаемость для каждого признака и доверительные интервалы для них. Эти данные интерпретируются следующим образом. Увеличение значения фактора на единицу (при том, что значения остальных факторов не изменияются) влечёт за собой увеличение отклика во столько раз, каков множитель при весовом коэффициенте фактора.
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+exp(coefficients(m7))[-1]
+exp(confint(m7))[-1,]
+```
+
+Расшифровка значений факторов. Что не представлены выше в таблице -- были исключены из построения модели как незначимые или сильно скоррелированные с другими.
+
+```{r}
+data_head = read.csv("description.csv", header = F, dec=",")
+data_head
+```
+
+Все приведённые доверительные интервалы построены на уровне доверия 95%.
+
+***
