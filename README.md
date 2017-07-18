@@ -1,3 +1,5 @@
+advanced logistic regression 
+
 Постановка задачи
 ==================
 
